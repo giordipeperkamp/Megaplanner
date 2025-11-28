@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.vscode/
+.streamlit/
+output/
+data/custom/*.csv
+data/custom/*.xlsx
+data/custom/*.json
+node_modules/
+dist/
+build/
+

@@ -1,0 +1,11 @@
+from_location_id,to_location_id,minutes
+L1,L1,0
+L1,L2,35
+L1,L3,25
+L2,L1,35
+L2,L2,0
+L2,L3,30
+L3,L1,25
+L3,L2,30
+L3,L3,0
+

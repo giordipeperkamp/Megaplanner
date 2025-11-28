@@ -1,0 +1,5 @@
+doctor_id,name,max_sessions,unavailable_dates,skills
+D1,Dr. Janssen,12,2025-12-05;2025-12-12,algemeen;cardio
+D2,Dr. Bakker,10,,algemeen
+D3,Dr. Visser,8,2025-12-09,arbeidsgeneeskunde
+

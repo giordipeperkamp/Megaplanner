@@ -1,0 +1,5 @@
+location_id,name,default_start_time,default_end_time
+L1,Locatie Centrum,09:00,17:00
+L2,Locatie West,08:30,16:30
+L3,Locatie Oost,09:00,16:00
+

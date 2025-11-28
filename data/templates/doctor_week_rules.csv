@@ -1,0 +1,7 @@
+doctor_id,week_of_month,weekday,location_id
+D1,1,ma,L1
+D1,1,wo,L1
+D1,2,di,L2
+D1,2,vr,L2
+D2,3,do,L3
+
