@@ -77,6 +77,15 @@ if (-not $remoteUrl) {
 }
 
 # 6) Push
+try {
+    git fetch origin | Out-Null
+} catch { }
+
+try {
+    # Integreer remote (README/licentie) met lokale geschiedenis
+    git pull --rebase origin main --allow-unrelated-histories | Out-Null
+} catch { }
+
 git push -u origin main
 
 Write-Host ""
