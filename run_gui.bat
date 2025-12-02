@@ -21,3 +21,4 @@ echo.
 echo Klaar. Dit venster sluiten om te stoppen.
 pause
 
+image.png

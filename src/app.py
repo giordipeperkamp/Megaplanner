@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import io
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, time
+from textwrap import dedent
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
+from string import Template
 
+import json
 import pandas as pd
 import streamlit as st
+from dateutil import parser as dateparser
 
 # Compatibele imports: werk zowel als pakket (python -m) als los script (streamlit run src/app.py)
 try:
@@ -46,6 +50,10 @@ st.title("Megaplanner - Planner (MVP GUI)")
 
 # Moduskeuze
 mode = st.sidebar.radio("Modus", ["Overzicht (simpel)", "Beheer (tabel)", "Agenda (planning)"], index=0)
+sidebar_panel = st.sidebar.empty()
+
+INFO_FIELD_DOCTOR = "doctor"
+INFO_FIELD_ROOM = "room"
 
 
 def load_csv_df(path: str, required_cols: List[str]) -> pd.DataFrame:
@@ -240,7 +248,706 @@ if mode == "Beheer (tabel)":
                 st.caption("Automatisch opgeslagen naar data/custom.")
 else:
     st.subheader("Overzicht")
-    tab_locs, tab_docs_wd = st.tabs(["Locaties & Kamers", "Artsen & Werkdagen"])
+    tab_plan, tab_docs_wd, tab_locs = st.tabs(["Planner", "Artsen & Werkdagen", "Locaties & Kamers"])
+
+    # TAB 0: Planner (snelle toegang)
+    with tab_plan:
+        st.caption("Plan direct op basis van huidige data. Gebruik indien nodig eerst de generator of import.")
+        if st.button("Maak planning (tab Planner)"):
+            def df_to_csv_bytes(df: pd.DataFrame) -> io.BytesIO:
+                buf = io.BytesIO()
+                df.to_csv(buf, index=False)
+                buf.seek(0)
+                return buf
+
+            doctors = read_doctors(df_to_csv_bytes(state.dfs["doctors"]))
+            locations = read_locations(df_to_csv_bytes(state.dfs["locations"]))
+            sessions = read_sessions(df_to_csv_bytes(state.dfs["sessions"]))
+            preferences = read_preferences(df_to_csv_bytes(state.dfs["preferences"]))
+            travel_times = read_travel_times(df_to_csv_bytes(state.dfs["travel_times"])) if len(state.dfs["travel_times"]) > 0 else {}
+            workdays = read_doctor_workdays(df_to_csv_bytes(state.dfs["doctor_workdays"])) if len(state.dfs["doctor_workdays"]) > 0 else {}
+            week_rules = read_doctor_week_rules(df_to_csv_bytes(state.dfs["doctor_week_rules"])) if len(state.dfs["doctor_week_rules"]) > 0 else []
+            try:
+                assignments, objective = solve_schedule(doctors, locations, sessions, preferences, travel_times, workdays, week_rules)
+            except Exception as e:
+                st.error(f"Planner fout: {e}")
+            else:
+                st.success(f"Planning gereed. Totale voorkeursscore: {objective}")
+                rows = []
+                for sess_id, doc_id in assignments.items():
+                    s = sessions[sess_id]
+                    d = doctors[doc_id]
+                    rows.append({
+                        "date": s.date.isoformat(),
+                        "session_id": s.session_id,
+                        "location_id": s.location_id,
+                        "doctor_id": d.doctor_id,
+                        "doctor_name": d.name,
+                        "start_time": s.start_time.strftime("%H:%M"),
+                        "end_time": s.end_time.strftime("%H:%M"),
+                        "room": getattr(s, "room", ""),
+                        "required_skill": s.required_skill or "",
+                    })
+                result_df = pd.DataFrame(rows).sort_values(["date", "location_id", "start_time"])
+                st.dataframe(result_df, use_container_width=True)
+                state.schedule_df = result_df.copy()
+                try:
+                    write_schedule_csv(Path("output/schedule.csv"), assignments, doctors, locations, sessions)
+                except Exception:
+                    pass
+                csv_buf = io.StringIO()
+                result_df.to_csv(csv_buf, index=False)
+                st.download_button("Download CSV", data=csv_buf.getvalue(), file_name="schedule.csv", mime="text/csv")
+
+        st.markdown("---")
+        st.subheader("Weekagenda per locatie/kamer (handmatig inplannen)")
+        # Selectie: locatie, kamer(s), week
+        loc_df = state.dfs.get("locations", pd.DataFrame(columns=["location_id","name"]))
+        room_df = state.dfs.get("rooms", pd.DataFrame(columns=["room_id","location_id","name"]))
+        sess_df = state.dfs.get("sessions", pd.DataFrame(columns=["session_id","date","location_id","start_time","end_time","required_skill","room"]))
+
+        def _parse_hhmm_to_minutes(txt: str) -> Optional[int]:
+            try:
+                hh, mm = str(txt).strip().split(":")
+                return int(hh) * 60 + int(mm)
+            except Exception:
+                return None
+
+        def _location_default_bounds(loc_id: str) -> Tuple[str, str]:
+            start = "09:00"
+            end = "17:00"
+            loc_df_all = state.dfs.get("locations", pd.DataFrame(columns=["location_id","default_start_time","default_end_time"]))
+            loc_row = loc_df_all[loc_df_all["location_id"].astype(str).str.strip() == str(loc_id)]
+            if len(loc_row) == 1:
+                s = str(loc_row.iloc[0].get("default_start_time","")).strip()
+                e = str(loc_row.iloc[0].get("default_end_time","")).strip()
+                if len(s) == 5:
+                    start = s
+                if len(e) == 5:
+                    end = e
+            return start, end
+
+        if len(loc_df) == 0:
+            st.info("Geen locaties beschikbaar. Voeg eerst locaties toe.")
+        else:
+            loc_options = [(str(r.get("name","")) or str(r["location_id"]), str(r["location_id"])) for _, r in loc_df.iterrows()]
+            sel_loc_label = st.selectbox("Locatie", [lbl for (lbl, _id) in loc_options], index=0)
+            sel_loc = dict(loc_options)[sel_loc_label]
+            # Kameropties voor locatie
+            rooms_for_loc = room_df[room_df["location_id"].astype(str).str.strip() == str(sel_loc)]
+            room_choices = ["Alle kamers"]
+            room_map = {}
+            for _, rr in rooms_for_loc.iterrows():
+                nm = str(rr.get("name","")) or str(rr.get("room_id",""))
+                room_choices.append(nm)
+                room_map[nm] = nm
+            sel_room = st.selectbox("Kamer", room_choices, index=0)
+
+            # Context en korte uitleg
+            st.info(f"Locatie: {sel_loc_label}  |  Kamerfilter: {sel_room} — Sleep in de kalender om een nieuw blok te maken; klik op een blok om te bewerken of verwijderen.")
+
+
+            # Weergave-instellingen
+            col_view1, col_view2 = st.columns([1,1])
+            with col_view1:
+                show_full_day = st.checkbox("Toon hele dag (00–24u)", value=False)
+            with col_view2:
+                st.caption("Resolutie staat vast op 15 minuten (sleep/klik).")
+            # Weekkeuze (maandag start)
+            pick = st.date_input("Week (kies een datum in de week)", value=date.today())
+            week_start = pick - timedelta(days=(pick.weekday()))  # maandag
+            week_end = week_start + timedelta(days=6)
+            st.caption(f"Week: {week_start.isoformat()} t/m {week_end.isoformat()}")
+
+            # Snel "Outlook-achtig" afspraak toevoegen (voegt sessie toe)
+            with st.popover("Nieuwe afspraak (zoals Outlook)"):
+                ap_date = st.date_input("Datum", value=pick, min_value=week_start, max_value=week_end, key="ap_date_new")
+                ap_start = st.time_input("Start", value=datetime.now().replace(hour=9, minute=0).time(), key="ap_start_new")
+                ap_end = st.time_input("Einde", value=datetime.now().replace(hour=10, minute=0).time(), key="ap_end_new")
+                ap_room = st.selectbox("Kamer (optioneel)", [""] + rooms_for_loc["name"].astype(str).fillna("").tolist(), index=0, key="ap_room_new")
+                # Arts (optioneel) om direct te koppelen
+                docs_df_all = state.dfs.get("doctors", pd.DataFrame(columns=["doctor_id","name"]))
+                doc_opts = [""] + [f'{str(r.get("name","")) or str(r["doctor_id"])} [{str(r["doctor_id"])}]' for _, r in docs_df_all.iterrows()]
+                ap_doc_label = st.selectbox("Arts (optioneel)", doc_opts, index=0, key="ap_doc_new")
+                ap_skill = st.text_input("Titel / opmerking (wordt getoond)", value="", key="ap_skill_new")
+                if st.button("Opslaan (voeg toe)"):
+                    # maak unieke session_id
+                    def _make_id(d: date, loc: str, hh: int, mm: int) -> str:
+                        base = f"GEN-{d.strftime('%Y%m%d')}-{loc}-{hh:02d}{mm:02d}"
+                        sid = base
+                        k = 2
+                        existing = set(sess_df["session_id"].astype(str)) if len(sess_df) else set()
+                        while sid in existing:
+                            sid = f"{base}-{k}"; k += 1
+                        return sid
+                    sid = _make_id(ap_date, sel_loc, ap_start.hour, ap_start.minute)
+                    new_row = {
+                        "session_id": sid,
+                        "date": ap_date.isoformat(),
+                        "location_id": sel_loc,
+                        "start_time": f"{ap_start.hour:02d}:{ap_start.minute:02d}",
+                        "end_time": f"{ap_end.hour:02d}:{ap_end.minute:02d}",
+                        "required_skill": ap_skill,
+                        "room": ap_room or "",
+                    }
+                    sess2 = state.dfs.get("sessions", pd.DataFrame(columns=list(new_row.keys()))).copy()
+                    sess2.loc[len(sess2)] = new_row
+                    state.dfs["sessions"] = sess2
+                    # Koppel arts indien gekozen
+                    if ap_doc_label and "[" in ap_doc_label and "]" in ap_doc_label:
+                        did = ap_doc_label.split("[")[-1].split("]")[0].strip()
+                        if not hasattr(state, "manual_assignments"):
+                            state.manual_assignments = {}
+                        state.manual_assignments[sid] = did
+                    _autosave()
+                    st.success("Afspraak toegevoegd.")
+
+            # Filter sessies
+            def _to_date(x: str) -> Optional[date]:
+                try:
+                    return datetime.strptime(str(x).strip(), "%Y-%m-%d").date()
+                except Exception:
+                    return None
+            sess_tmp = sess_df.copy()
+            sess_tmp["__d"] = sess_tmp["date"].apply(_to_date)
+            mask = (
+                (sess_tmp["location_id"].astype(str).str.strip() == str(sel_loc)) &
+                (sess_tmp["__d"] >= week_start) & (sess_tmp["__d"] <= week_end)
+            )
+            if sel_room != "Alle kamers":
+                sess_tmp = sess_tmp[mask & (sess_tmp["room"].astype(str).fillna("").str.strip() == room_map.get(sel_room, ""))]
+            else:
+                sess_tmp = sess_tmp[mask]
+
+            # FullCalendar integratie (prefereer lokale aangepaste build)
+            using_custom_calendar = False
+            try:
+                from src.webui.mega_calendar import calendar as st_calendar  # type: ignore
+                using_custom_calendar = True
+            except Exception:
+                try:
+                    from streamlit_calendar import calendar as st_calendar  # type: ignore
+                except Exception:
+                    st.error("De kalendercomponent ontbreekt. Installeer dependencies met: pip install -r requirements.txt")
+                    st.stop()
+
+            # Zorg voor container voor handmatige arts-toewijzingen
+            if not hasattr(state, "manual_assignments"):
+                state.manual_assignments = {}
+
+            # Kleuren per kamer + legenda
+            def _room_color_map() -> Dict[str, str]:
+                palette = ["#4C78A8","#F58518","#54A24B","#EECA3B","#B279A2","#FF9DA6","#9D755D","#B7B7B7",
+                           "#1F77B4","#FF7F0E","#2CA02C","#D62728","#9467BD","#8C564B","#E377C2","#7F7F7F","#BCBD22","#17BECF"]
+                rooms = [str(x) for x in rooms_for_loc["name"].dropna().unique().tolist()]
+                mapping: Dict[str,str] = {}
+                for i, rn in enumerate(sorted(rooms)):
+                    mapping[rn] = palette[i % len(palette)]
+                return mapping
+            room_colors = _room_color_map()
+            if len(room_colors) > 0:
+                cols_leg = st.columns(min(4, max(1, len(room_colors))))
+                j = 0
+                for rn, col in room_colors.items():
+                    cols_leg[j % len(cols_leg)].markdown(f"<span style='display:inline-block;width:12px;height:12px;background:{col};border:1px solid #666;margin-right:6px;vertical-align:middle;'></span><span style='vertical-align:middle;'>{rn}</span>", unsafe_allow_html=True)
+                    j += 1
+
+            doctor_df = state.dfs.get("doctors", pd.DataFrame(columns=["doctor_id","name"]))
+            doc_label_map = {str(rr["doctor_id"]): (str(rr.get("name","")) or str(rr["doctor_id"])) for _, rr in doctor_df.iterrows()}
+            doctor_meta = [{"id": did, "label": nm} for did, nm in doc_label_map.items()]
+
+            room_meta: list[dict[str, str]] = []
+            for _, row in rooms_for_loc.iterrows():
+                label = (str(row.get("name", "")).strip() or str(row.get("room_id", "")).strip())
+                if label:
+                    room_meta.append({"id": label, "label": label})
+
+            default_day_start, default_day_end = _location_default_bounds(sel_loc)
+
+            slot_min = "07:00:00"; slot_max = "20:00:00"
+            if show_full_day:
+                slot_min, slot_max = "00:00:00", "24:00:00"
+            else:
+                if len(default_day_start) == 5:
+                    slot_min = f"{default_day_start}:00"
+                if len(default_day_end) == 5:
+                    slot_max = f"{default_day_end}:00"
+
+            events = []
+            for _, r in sess_tmp.iterrows():
+                dte = str(r["date"]).strip()
+                sid = str(r["session_id"])
+                # voeg artsnaam toe aan titel indien handmatig toegewezen
+                doctor_meta = [{"id": did, "label": nm} for did, nm in doc_label_map.items()]
+                doc_suffix = ""
+                if sid in state.manual_assignments:
+                    did = state.manual_assignments.get(sid)
+                    if did in doc_label_map:
+                        doc_suffix = f" · {doc_label_map[did]}"
+                room_name = str(r.get("room","")).strip()
+                color = room_colors.get(room_name) if room_name else None
+                events.append({
+                    "id": str(r["session_id"]),
+                    "title": (str(r.get("required_skill","")).strip() or "Sessie")
+                             + (f" · {str(r.get('room','')).strip()}" if str(r.get("room","")).strip() else "")
+                             + doc_suffix,
+                    "start": f"{dte}T{str(r['start_time']).strip()}:00",
+                    "end": f"{dte}T{str(r['end_time']).strip()}:00",
+                    **({"backgroundColor": color, "borderColor": color} if color else {}),
+                })
+
+            if len(default_day_start) == 5 and len(default_day_end) == 5 and default_day_start < default_day_end:
+                for i in range(7):
+                    dcur = week_start + timedelta(days=i)
+                    events.append({
+                        "id": f"default-day-{dcur.isoformat()}",
+                        "start": f"{dcur.isoformat()}T{default_day_start}:00",
+                        "end": f"{dcur.isoformat()}T{default_day_end}:00",
+                        "display": "background",
+                        "classNames": ["mp-workday-bg"],
+                    })
+
+            options = {
+                "initialView": "timeGridWeek",
+                "initialDate": week_start.isoformat(),
+                "slotMinTime": slot_min,
+                "slotMaxTime": slot_max,
+                "slotDuration": "00:15:00",
+                "snapDuration": "00:15:00",
+                "scrollTime": f"{default_day_start}:00" if len(default_day_start) == 5 else "07:00:00",
+                "expandRows": True,
+                "height": "auto",
+                "contentHeight": "auto",
+                "allDaySlot": False,
+                "firstDay": 1,
+                "locale": "nl",
+                "selectable": True,
+                "editable": True,
+                "selectMirror": True,
+                "nowIndicator": True,
+                "eventStartEditable": True,
+                "eventDurationEditable": True,
+                "eventOverlap": False,
+                "headerToolbar": {"left": "", "center": "", "right": ""},
+                "height": 1100 if show_full_day else 650,
+            }
+            # Optionele debug
+            debug = st.checkbox("Debug: toon kalender-callbacks", value=False, help="Handig om klik/drag events te zien als iets niet werkt.")
+
+            meta_payload = {
+                "rooms": room_meta,
+                "doctors": doctor_meta,
+                "defaultTitle": f"Spreekuur {sel_loc_label}".strip(),
+                "locationLabel": str(sel_loc_label),
+            }
+
+            calendar_css = """
+            .fc {
+                min-height: calc(100vh - 220px);
+            }
+            .fc .mp-workday-bg {
+                background-color: rgba(37, 99, 235, 0.08);
+            }
+            """
+
+            cal_state = st_calendar(
+                events=events,
+                options=options,
+                callbacks=["select","selectSubmit","eventClick","eventChange"],
+                key=f"cal_{sel_loc}_{sel_room}",
+                meta=meta_payload,
+                custom_css=calendar_css
+            )
+
+            def _parse_dt(v):
+                try:
+                    return dateparser.parse(v) if isinstance(v,str) else v
+                except Exception:
+                    return None
+
+            # Haal callback-naam + payload op; ondersteun meerdere return-vormen van streamlit-calendar
+            def _extract_cb(res: dict):
+                if not isinstance(res, dict):
+                    return None, None
+                if "callback" in res:
+                    cb_name = str(res.get("callback"))
+                    payload = res.get(cb_name) or res.get("data")
+                    if payload:
+                        return cb_name, payload
+                for key in ["select", "selectSubmit", "dateClick", "eventClick", "eventDrop", "eventResize", "eventChange"]:
+                    if key in res and res.get(key):
+                        return key, res.get(key)
+                # sommige versies geven { "event": {...}, "type": "eventClick" }
+                if "type" in res and "event" in res:
+                    return str(res["type"]), res
+                return None, None
+
+            cb, data = _extract_cb(cal_state)
+            if debug:
+                st.caption("Laatste kalender-event")
+                st.json({"callback": cb, "data": data})
+
+            # Paneel voor geselecteerde sessie (altijd zichtbaar na klik)
+            if "selected_event" not in state:
+                state.selected_event = None
+
+            # Compatibele modal helper (werkt met oudere Streamlit-versies zonder st.modal)
+            def _modal(title: str, key: str):
+                # Gebruik echte modals als beschikbaar; anders veilige expander-fallback
+                if getattr(st, "modal", None):
+                    return st.modal(title, key=key)
+                # st.dialog (decorator) is op oudere versies geen context manager → overslaan
+                return st.expander(title, expanded=True)
+
+            # Veilige rerun (werkt op oud/nieuw Streamlit)
+            def _safe_rerun() -> None:
+                rerun_fn = getattr(st, "rerun", None)
+                if callable(rerun_fn):
+                    try:
+                        rerun_fn()
+                    except Exception:
+                        pass
+
+            if cb == "select" and isinstance(data, dict) and not using_custom_calendar:
+                sdt = _parse_dt(data.get("start") or data.get("startStr"))
+                edt = _parse_dt(data.get("end") or data.get("endStr"))
+                # Modal of fallback-paneel
+                container = _modal("Nieuwe sessie", key=f"modal_new_{sel_loc}_{sel_room}")
+                with container:
+                    start_label = (data.get("startStr") or (sdt.strftime('%Y-%m-%d %H:%M') if sdt else "onbekend"))
+                    end_label = (data.get("endStr") or (edt.strftime('%H:%M') if edt else "onbekend"))
+                    st.write(f"{start_label} – {end_label}")
+                    with st.form("new_session_fullcalendar"):
+                        title = st.text_input("Titel/opmerking", value="Spreekuur")
+                        room_choice = st.selectbox("Kamer", [""] + rooms_for_loc["name"].astype(str).fillna("").tolist(), index=0)
+                        doctor_df = state.dfs.get("doctors", pd.DataFrame(columns=["doctor_id","name"]))
+                        doc_label_map = {str(r["doctor_id"]): (str(r.get("name","")) or str(r["doctor_id"])) for _, r in doctor_df.iterrows()}
+                        doc_label = st.selectbox("Arts (optioneel)", ["(geen)"] + [f"{nm} [{did}]" for did, nm in doc_label_map.items()], index=0)
+                        # Tijd aanpassen (zoals Outlook)
+                        sel_date = st.date_input("Datum", value=(sdt.date() if sdt else week_start), min_value=week_start, max_value=week_end, key="new_dt")
+                        st_col1, st_col2 = st.columns(2)
+                        with st_col1:
+                            start_time_val = st.time_input("Start", value=(sdt.time() if sdt else time(9, 0)), key="new_start_t")
+                        with st_col2:
+                            end_time_val = st.time_input("Einde", value=(edt.time() if edt else time(10, 0)), key="new_end_t")
+                        c1, c2 = st.columns([1,1])
+                        save = c1.form_submit_button("Opslaan")
+                        cancel = c2.form_submit_button("Annuleren")
+                        if save:
+                            # Valideer datums/tijden
+                            if not sel_date or not start_time_val or not end_time_val:
+                                st.error("Tijdselectie niet correct ontvangen. Probeer opnieuw te slepen.")
+                                st.stop()
+                            sid_base = f"GEN-{sel_date.strftime('%Y%m%d')}-{sel_loc}-{start_time_val.strftime('%H%M')}"
+                            sid = sid_base; i = 2
+                            existing = set(state.dfs["sessions"]["session_id"].astype(str))
+                            while sid in existing: sid = f"{sid_base}-{i}"; i += 1
+                            new_row = {
+                                "session_id": sid,
+                                "date": sel_date.strftime("%Y-%m-%d"),
+                                "location_id": sel_loc,
+                                "start_time": start_time_val.strftime("%H:%M"),
+                                "end_time": end_time_val.strftime("%H:%M"),
+                                "required_skill": title,
+                                "room": room_choice or "",
+                            }
+                            sess2 = state.dfs["sessions"].copy()
+                            sess2.loc[len(sess2)] = new_row
+                            state.dfs["sessions"] = sess2
+                        if doc_label != "(geen)":
+                            did = doc_label.split("[")[-1].split("]")[0].strip()
+                            if not hasattr(state, "manual_assignments"):
+                                state.manual_assignments = {}
+                            state.manual_assignments[sid] = did
+                        _autosave()
+                        st.success("Sessie toegevoegd.")
+                        _safe_rerun()
+
+            # Klik op lege tijdslot (zonder slepen) → maak pop-up met default 1 uur
+            if cb == "dateClick" and isinstance(data, dict) and not using_custom_calendar:
+                sdt = _parse_dt(data.get("date") or data.get("dateStr"))
+                if not sdt:
+                    sdt = datetime.combine(week_start, time(9, 0))
+                edt = sdt + timedelta(hours=1)
+                container = _modal("Nieuwe sessie", key=f"modal_new_click_{sel_loc}_{sel_room}")
+                with container:
+                    with st.form("new_session_click"):
+                        title = st.text_input("Titel/opmerking", value="Spreekuur")
+                        room_choice = st.selectbox("Kamer", [""] + rooms_for_loc["name"].astype(str).fillna("").tolist(), index=0, key="click_room")
+                        doctor_df = state.dfs.get("doctors", pd.DataFrame(columns=["doctor_id","name"]))
+                        doc_label_map = {str(r["doctor_id"]): (str(r.get("name","")) or str(r["doctor_id"])) for _, r in doctor_df.iterrows()}
+                        doc_label = st.selectbox("Arts (optioneel)", ["(geen)"] + [f"{nm} [{did}]" for did, nm in doc_label_map.items()], index=0, key="click_doc")
+                        sel_date = st.date_input("Datum", value=sdt.date(), min_value=week_start, max_value=week_end, key="click_date")
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            start_time_val = st.time_input("Start", value=sdt.time(), key="click_start")
+                        with c2:
+                            end_time_val = st.time_input("Einde", value=edt.time(), key="click_end")
+                        save = st.form_submit_button("Opslaan")
+                        if save:
+                            sid_base = f"GEN-{sel_date.strftime('%Y%m%d')}-{sel_loc}-{start_time_val.strftime('%H%M')}"
+                            sid = sid_base; i = 2
+                            existing = set(state.dfs["sessions"]["session_id"].astype(str))
+                            while sid in existing: sid = f"{sid_base}-{i}"; i += 1
+                            sess2 = state.dfs["sessions"].copy()
+                            sess2.loc[len(sess2)] = {
+                                "session_id": sid,
+                                "date": sel_date.strftime("%Y-%m-%d"),
+                                "location_id": sel_loc,
+                                "start_time": start_time_val.strftime("%H:%M"),
+                                "end_time": end_time_val.strftime("%H:%M"),
+                                "required_skill": title,
+                                "room": room_choice or "",
+                            }
+                            state.dfs["sessions"] = sess2
+                            if doc_label != "(geen)":
+                                did = doc_label.split("[")[-1].split("]")[0].strip()
+                                if not hasattr(state, "manual_assignments"):
+                                    state.manual_assignments = {}
+                                state.manual_assignments[sid] = did
+                            _autosave()
+                            st.success("Sessie toegevoegd.")
+                            _safe_rerun()
+
+            if cb == "selectSubmit" and isinstance(data, dict):
+                sel_date_txt = str(data.get("date", "")).strip()
+                start_txt = str(data.get("start", "")).strip()
+                end_txt = str(data.get("end", "")).strip()
+                title_txt = (str(data.get("title", "")).strip() or "Spreekuur")
+                room_choice = str(data.get("roomId", "")).strip()
+                doctor_choice = str(data.get("doctorId", "")).strip()
+                if not sel_date_txt or not start_txt or not end_txt:
+                    st.error("Selectie niet compleet ontvangen. Probeer opnieuw te slepen.")
+                else:
+                    try:
+                        sel_date_val = datetime.strptime(sel_date_txt, "%Y-%m-%d").date()
+                    except ValueError:
+                        sel_date_val = week_start
+                    sid_base = f"GEN-{sel_date_val.strftime('%Y%m%d')}-{sel_loc}-{start_txt.replace(':','')}"
+                    sid = sid_base; i = 2
+                    existing = set(state.dfs["sessions"]["session_id"].astype(str))
+                    while sid in existing:
+                        sid = f"{sid_base}-{i}"
+                        i += 1
+                    sess2 = state.dfs["sessions"].copy()
+                    sess2.loc[len(sess2)] = {
+                        "session_id": sid,
+                        "date": sel_date_val.strftime("%Y-%m-%d"),
+                        "location_id": sel_loc,
+                        "start_time": start_txt,
+                        "end_time": end_txt,
+                        "required_skill": title_txt,
+                        "room": room_choice,
+                    }
+                    state.dfs["sessions"] = sess2
+                    if doctor_choice:
+                        if not hasattr(state, "manual_assignments"):
+                            state.manual_assignments = {}
+                        state.manual_assignments[sid] = doctor_choice
+                    _autosave()
+                    st.success("Sessie toegevoegd.")
+                    _safe_rerun()
+
+            if cb in ("eventDrop","eventResize","eventChange") and isinstance(data, dict):
+                ev = data.get("event", {})
+                sid = str(ev.get("id",""))
+                sdt = _parse_dt(ev.get("start")); edt = _parse_dt(ev.get("end"))
+                if sid and sdt and edt:
+                    df = state.dfs["sessions"].copy()
+                    idx = df.index[df["session_id"].astype(str) == sid].tolist()
+                    if idx:
+                        i = idx[0]
+                        df.at[i, "date"] = sdt.strftime("%Y-%m-%d")
+                        df.at[i, "start_time"] = sdt.strftime("%H:%M")
+                        df.at[i, "end_time"] = edt.strftime("%H:%M")
+                        state.dfs["sessions"] = df
+                        _autosave()
+                        st.success("Sessie bijgewerkt.")
+                        _safe_rerun()
+
+            if cb == "eventClick" and isinstance(data, dict):
+                # Toon overlay met samenvatting; geen bewerkformulier hier
+                ev = data.get("event", {})
+                sid = str(ev.get("id",""))
+                sdt = _parse_dt(ev.get("start") or ev.get("startStr"))
+                edt = _parse_dt(ev.get("end") or ev.get("endStr"))
+                title = str(ev.get("title",""))
+                room_val = ""
+                doctor_name = ""
+                df_tmp = state.dfs["sessions"].copy()
+                row_tmp = df_tmp[df_tmp["session_id"].astype(str) == sid]
+                if len(row_tmp) == 1:
+                    rtmp = row_tmp.iloc[0]
+                    room_val = str(rtmp.get("room","")) or ""
+                    did = state.manual_assignments.get(sid, "")
+                    if did:
+                        ddf = state.dfs.get("doctors", pd.DataFrame(columns=["doctor_id","name"]))
+                        name_series = ddf[ddf["doctor_id"].astype(str) == str(did)]["name"]
+                        if not name_series.empty:
+                            doctor_name = str(name_series.iloc[0])
+                state.selected_event = {
+                    "id": sid,
+                    "title": title or "(geen titel)",
+                    "date": sdt.strftime("%Y-%m-%d") if sdt else "",
+                    "start": sdt.strftime("%H:%M") if sdt else "",
+                    "end": edt.strftime("%H:%M") if edt else "",
+                    INFO_FIELD_ROOM: room_val,
+                    INFO_FIELD_DOCTOR: doctor_name,
+                }
+
+            # Fallback-bediening als pop-ups niet verschijnen bij slepen/klikken
+            st.markdown("")
+            with st.expander("Handmatig: nieuwe sessie of verwijderen (fallback)", expanded=False):
+                cols_fb = st.columns(2)
+                with cols_fb[0]:
+                    st.caption("Nieuwe sessie (fallback)")
+                    with st.form("fallback_new_session"):
+                        dflt_day = week_start
+                        new_date = st.date_input("Datum", value=dflt_day, min_value=week_start, max_value=week_start + timedelta(days=6))
+                        new_start = st.time_input("Start", value=datetime.now().replace(hour=9, minute=0).time())
+                        new_end = st.time_input("Einde", value=datetime.now().replace(hour=10, minute=0).time())
+                        new_title = st.text_input("Titel/opmerking", value="Spreekuur")
+                        new_room = st.selectbox("Kamer", [""] + rooms_for_loc["name"].astype(str).fillna("").tolist(), index=0, key="fb_room")
+                        if st.form_submit_button("Toevoegen"):
+                            sid_base = f"GEN-{new_date.strftime('%Y%m%d')}-{sel_loc}-{new_start.strftime('%H%M')}"
+                            sid = sid_base; i = 2
+                            existing = set(state.dfs["sessions"]["session_id"].astype(str))
+                            while sid in existing: sid = f"{sid_base}-{i}"; i += 1
+                            sess2 = state.dfs["sessions"].copy()
+                            sess2.loc[len(sess2)] = {
+                                "session_id": sid,
+                                "date": new_date.strftime("%Y-%m-%d"),
+                                "location_id": sel_loc,
+                                "start_time": new_start.strftime("%H:%M"),
+                                "end_time": new_end.strftime("%H:%M"),
+                                "required_skill": new_title,
+                                "room": new_room or "",
+                            }
+                            state.dfs["sessions"] = sess2
+                            _autosave()
+                            st.success("Sessie toegevoegd.")
+                            _safe_rerun()
+                with cols_fb[1]:
+                    st.caption("Verwijderen (fallback)")
+                    if len(sess_tmp) == 0:
+                        st.write("Geen sessies in deze week.")
+                    else:
+                        # lijst met zichtbare (gefilterde) sessies
+                        display = [f"{r['date']} {r['start_time']}-{r['end_time']} · {r['session_id']}" for _, r in sess_tmp.iterrows()]
+                        choice = st.selectbox("Kies sessie", options=display, index=0, key="fb_del_sel")
+                        if st.button("Verwijderen", key="fb_del_btn"):
+                            sid = choice.split("·")[-1].strip()
+                            df = state.dfs["sessions"].copy()
+                            idx = df.index[df["session_id"].astype(str) == sid].tolist()
+                            if idx:
+                                df = df.drop(index=idx[0]).reset_index(drop=True)
+                                state.dfs["sessions"] = df
+                                _autosave()
+                                st.success(f"Sessie {sid} verwijderd.")
+                                _safe_rerun()
+
+            with sidebar_panel.container():
+                st.subheader("Sessiedetails")
+                info = state.selected_event
+                if not info:
+                    st.info("Klik op een blok in de planner om details te bekijken of te bewerken.")
+                else:
+                    sid = str(info.get("id",""))
+                    df = state.dfs["sessions"].copy()
+                    row = df[df["session_id"].astype(str) == sid]
+                    if len(row) == 0:
+                        st.warning("Deze sessie bestaat niet meer.")
+                        if st.button("Reset selectie"):
+                            state.selected_event = None
+                            _safe_rerun()
+                    else:
+                        r = row.iloc[0]
+                        st.markdown(f"**Titel:** {info.get('title','')}")
+                        st.markdown(f"**Datum:** {info.get('date','-')}  \n**Tijd:** {info.get('start','-')} – {info.get('end','-')}")
+                        st.markdown(f"**Kamer:** {info.get(INFO_FIELD_ROOM,'-')}")
+                        st.markdown(f"**Arts:** {info.get(INFO_FIELD_DOCTOR,'-') or '-'}")
+
+                        try:
+                            date_val = datetime.strptime(str(r.get("date","")), "%Y-%m-%d").date()
+                        except Exception:
+                            date_val = date.today()
+                        try:
+                            start_val = datetime.strptime(str(r.get("start_time","00:00")), "%H:%M").time()
+                        except Exception:
+                            start_val = time(9,0)
+                        try:
+                            end_val = datetime.strptime(str(r.get("end_time","00:00")), "%H:%M").time()
+                        except Exception:
+                            end_val = time(10,0)
+
+                        room_names = [""] + rooms_for_loc["name"].astype(str).fillna("").tolist()
+                        current_room = str(r.get("room","")).strip()
+                        room_idx = room_names.index(current_room) if current_room in room_names else 0
+
+                        doctor_df = state.dfs.get("doctors", pd.DataFrame(columns=["doctor_id","name"]))
+                        doc_label_map = {str(rr["doctor_id"]): (str(rr.get("name","")) or str(rr["doctor_id"])) for _, rr in doctor_df.iterrows()}
+                        doc_options = ["(geen)"] + [f"{nm} [{did}]" for did, nm in doc_label_map.items()]
+                        current_did = state.manual_assignments.get(sid, "")
+                        default_doc_idx = 0
+                        if current_did and current_did in doc_label_map:
+                            label = f"{doc_label_map[current_did]} [{current_did}]"
+                            if label in doc_options:
+                                default_doc_idx = doc_options.index(label)
+
+                        with st.form(f"sidebar_edit_{sid}"):
+                            title = st.text_input("Titel/opmerking", value=str(r.get("required_skill","")), key=f"title_sidebar_{sid}")
+                            date_input = st.date_input("Datum", value=date_val, key=f"date_sidebar_{sid}")
+                            col_ta, col_tb = st.columns(2)
+                            with col_ta:
+                                start_input = st.time_input("Start", value=start_val, key=f"start_sidebar_{sid}")
+                            with col_tb:
+                                end_input = st.time_input("Einde", value=end_val, key=f"end_sidebar_{sid}")
+                            room_choice = st.selectbox("Kamer", room_names, index=room_idx, key=f"room_sidebar_{sid}")
+                            doc_choice = st.selectbox("Arts (optioneel)", doc_options, index=default_doc_idx, key=f"doc_sidebar_{sid}")
+                            save = st.form_submit_button("Opslaan")
+                            delete = st.form_submit_button("Verwijderen")
+
+                        if save:
+                            i = row.index[0]
+                            df.at[i, "required_skill"] = title
+                            df.at[i, "room"] = room_choice or ""
+                            df.at[i, "date"] = date_input.strftime("%Y-%m-%d")
+                            df.at[i, "start_time"] = start_input.strftime("%H:%M")
+                            df.at[i, "end_time"] = end_input.strftime("%H:%M")
+                            state.dfs["sessions"] = df
+                            if doc_choice != "(geen)":
+                                did = doc_choice.split("[")[-1].split("]")[0].strip()
+                                state.manual_assignments[sid] = did
+                                info.update({"doctor": doc_label_map.get(did, did)})
+                            elif sid in state.manual_assignments:
+                                del state.manual_assignments[sid]
+                                info.update({"doctor": "-"})
+                            info.update({
+                                "title": title,
+                                "date": date_input.strftime("%Y-%m-%d"),
+                                "start": start_input.strftime("%H:%M"),
+                                "end": end_input.strftime("%H:%M"),
+                                INFO_FIELD_ROOM: room_choice or "-",
+                            })
+                            _autosave()
+                            st.success("Sessie opgeslagen.")
+                            _safe_rerun()
+
+                        if delete:
+                            i = row.index[0]
+                            df = df.drop(index=i).reset_index(drop=True)
+                            state.dfs["sessions"] = df
+                            if sid in state.manual_assignments:
+                                del state.manual_assignments[sid]
+                            _autosave()
+                            st.success("Sessie verwijderd.")
+                            state.selected_event = None
+                            _safe_rerun()
+
+                        if st.button("Selectie sluiten"):
+                            state.selected_event = None
+                            _safe_rerun()
+
 
     # TAB 1: Locaties & Kamers
     with tab_locs:
@@ -669,7 +1376,7 @@ else:
                                 docs2.at[i, "home_dates"] = ";".join(sorted(d.isoformat() for d in current_home))
                             state.dfs["doctors"] = docs2
                             _autosave()
-                            st.experimental_rerun()
+                            _safe_rerun()
 
                     act1, act2, act3, act4 = st.columns(4)
                     with act1:
@@ -802,87 +1509,87 @@ else:
 
                     # Opslaan-knop is niet meer nodig; clicks slaan direct op
 
-    # Werkdagen artsen (in dezelfde tab)
-    st.markdown("---")
-    st.markdown("Werkdagen artsen")
-    left2, right2 = st.columns([1,2])
-    with left2:
-        st.caption("Bulk import werkdagen (CSV/XLSX)")
-        with st.popover("❓ Uitleg werkdagen"):
-            st.markdown(
-                "- Kolommen: `doctor_id,weekday` (1=ma, ..., 7=zo of `ma,di,wo,do,vr,za,zo`)\n"
-                "- Voorbeeld: D10,1"
+        # Werkdagen artsen (alleen zichtbaar in deze tab)
+        st.markdown("---")
+        st.markdown("Werkdagen artsen")
+        left2, right2 = st.columns([1,2])
+        with left2:
+            st.caption("Bulk import werkdagen (CSV/XLSX)")
+            with st.popover("❓ Uitleg werkdagen"):
+                st.markdown(
+                    "- Kolommen: `doctor_id,weekday` (1=ma, ..., 7=zo of `ma,di,wo,do,vr,za,zo`)\n"
+                    "- Voorbeeld: D10,1"
+                )
+            st.download_button(
+                "Template CSV - doctor_workdays",
+                data=_csv_template(
+                    ["doctor_id","weekday"],
+                    [["D10","ma"]]
+                ),
+                file_name="doctor_workdays_template.csv",
+                mime="text/csv"
             )
-        st.download_button(
-            "Template CSV - doctor_workdays",
-            data=_csv_template(
-                ["doctor_id","weekday"],
-                [["D10","ma"]]
-            ),
-            file_name="doctor_workdays_template.csv",
-            mime="text/csv"
-        )
-        up_wd = st.file_uploader("Bestand werkdagen", type=["csv","xlsx"], key="bulk_wd_file_v2")
-        wd_overwrite_all = st.checkbox("Bestaande werkdagen overschrijven voor dokters in bestand", value=False, key="bulk_wd_overwrite_v2")
-        if st.button("Importeer werkdagen", disabled=up_wd is None, key="btn_import_wd_v2"):
-            try:
-                if up_wd.name.lower().endswith(".xlsx"):
-                    df_new = pd.read_excel(up_wd, dtype=str).fillna("")
-                else:
-                    df_new = pd.read_csv(up_wd, dtype=str).fillna("")
-                req = ["doctor_id","weekday"]
-                miss = [c for c in req if c not in df_new.columns]
-                if miss:
-                    raise ValueError(f"Ontbrekende kolommen: {miss}")
-                # normaliseer weekday
-                df_new["weekday"] = df_new["weekday"].apply(lambda v: _wd_to_int(v))
-                df_new = df_new.dropna(subset=["weekday"])
-                wd_df = state.dfs["doctor_workdays"].copy()
-                if wd_overwrite_all:
-                    to_clear = set(df_new["doctor_id"].astype(str).str.strip())
-                    wd_df = wd_df[~wd_df["doctor_id"].astype(str).str.strip().isin(to_clear)]
-                merged = pd.concat([wd_df, df_new[req]], ignore_index=True)
-                merged = merged.drop_duplicates(subset=["doctor_id","weekday"], keep="last")
-                state.dfs["doctor_workdays"] = merged
-                st.success(f"Werkdagen geïmporteerd: {len(df_new)} rijen.")
-                _autosave()
-            except Exception as e:
-                st.error(f"Import werkdagen mislukt: {e}")
-    with right2:
-        st.markdown("Bewerk werkdagen per arts")
-        docs_df = state.dfs["doctors"].copy()
-        wd_df = state.dfs["doctor_workdays"].copy()
-        for _, drow in docs_df.sort_values(["name", "doctor_id"]).iterrows():
-            did = str(drow["doctor_id"]).strip()
-            dname = str(drow["name"]).strip() or did
-            rows = wd_df[wd_df["doctor_id"].astype(str).str.strip() == did]["weekday"].tolist()
-            curr_wd = set([v for v in (_wd_to_int(x) for x in rows) if v is not None])
-            with st.expander(f"{dname} ({did})", expanded=False):
-                st.caption("Wijzig werkdagen")
-                cc1, cc2, cc3, cc4, cc5, cc6, cc7 = st.columns(7)
-                with cc1: ma2 = st.checkbox("ma", value=(1 in curr_wd), key=f"edit_wd2_{did}_1")
-                with cc2: di2 = st.checkbox("di", value=(2 in curr_wd), key=f"edit_wd2_{did}_2")
-                with cc3: wo2 = st.checkbox("wo", value=(3 in curr_wd), key=f"edit_wd2_{did}_3")
-                with cc4: do2 = st.checkbox("do", value=(4 in curr_wd), key=f"edit_wd2_{did}_4")
-                with cc5: vr2 = st.checkbox("vr", value=(5 in curr_wd), key=f"edit_wd2_{did}_5")
-                with cc6: za2 = st.checkbox("za", value=(6 in curr_wd), key=f"edit_wd2_{did}_6")
-                with cc7: zo2 = st.checkbox("zo", value=(7 in curr_wd), key=f"edit_wd2_{did}_7")
-                if st.button("Opslaan werkdagen", key=f"save_wd2_{did}"):
-                    new_set = set()
-                    if ma2: new_set.add(1)
-                    if di2: new_set.add(2)
-                    if wo2: new_set.add(3)
-                    if do2: new_set.add(4)
-                    if vr2: new_set.add(5)
-                    if za2: new_set.add(6)
-                    if zo2: new_set.add(7)
-                    wd_df2 = state.dfs["doctor_workdays"].copy()
-                    wd_df2 = wd_df2[wd_df2["doctor_id"].astype(str).str.strip() != did]
-                    for d in sorted(new_set):
-                        wd_df2.loc[len(wd_df2)] = [did, d]
-                    state.dfs["doctor_workdays"] = wd_df2
+            up_wd = st.file_uploader("Bestand werkdagen", type=["csv","xlsx"], key="bulk_wd_file_v2")
+            wd_overwrite_all = st.checkbox("Bestaande werkdagen overschrijven voor dokters in bestand", value=False, key="bulk_wd_overwrite_v2")
+            if st.button("Importeer werkdagen", disabled=up_wd is None, key="btn_import_wd_v2"):
+                try:
+                    if up_wd.name.lower().endswith(".xlsx"):
+                        df_new = pd.read_excel(up_wd, dtype=str).fillna("")
+                    else:
+                        df_new = pd.read_csv(up_wd, dtype=str).fillna("")
+                    req = ["doctor_id","weekday"]
+                    miss = [c for c in req if c not in df_new.columns]
+                    if miss:
+                        raise ValueError(f"Ontbrekende kolommen: {miss}")
+                    # normaliseer weekday
+                    df_new["weekday"] = df_new["weekday"].apply(lambda v: _wd_to_int(v))
+                    df_new = df_new.dropna(subset=["weekday"])
+                    wd_df = state.dfs["doctor_workdays"].copy()
+                    if wd_overwrite_all:
+                        to_clear = set(df_new["doctor_id"].astype(str).str.strip())
+                        wd_df = wd_df[~wd_df["doctor_id"].astype(str).str.strip().isin(to_clear)]
+                    merged = pd.concat([wd_df, df_new[req]], ignore_index=True)
+                    merged = merged.drop_duplicates(subset=["doctor_id","weekday"], keep="last")
+                    state.dfs["doctor_workdays"] = merged
+                    st.success(f"Werkdagen geïmporteerd: {len(df_new)} rijen.")
                     _autosave()
-                    st.success("Werkdagen opgeslagen.")
+                except Exception as e:
+                    st.error(f"Import werkdagen mislukt: {e}")
+        with right2:
+            st.markdown("Bewerk werkdagen per arts")
+            docs_df = state.dfs["doctors"].copy()
+            wd_df = state.dfs["doctor_workdays"].copy()
+            for _, drow in docs_df.sort_values(["name", "doctor_id"]).iterrows():
+                did = str(drow["doctor_id"]).strip()
+                dname = str(drow["name"]).strip() or did
+                rows = wd_df[wd_df["doctor_id"].astype(str).str.strip() == did]["weekday"].tolist()
+                curr_wd = set([v for v in (_wd_to_int(x) for x in rows) if v is not None])
+                with st.expander(f"{dname} ({did})", expanded=False):
+                    st.caption("Wijzig werkdagen")
+                    cc1, cc2, cc3, cc4, cc5, cc6, cc7 = st.columns(7)
+                    with cc1: ma2 = st.checkbox("ma", value=(1 in curr_wd), key=f"edit_wd2_{did}_1")
+                    with cc2: di2 = st.checkbox("di", value=(2 in curr_wd), key=f"edit_wd2_{did}_2")
+                    with cc3: wo2 = st.checkbox("wo", value=(3 in curr_wd), key=f"edit_wd2_{did}_3")
+                    with cc4: do2 = st.checkbox("do", value=(4 in curr_wd), key=f"edit_wd2_{did}_4")
+                    with cc5: vr2 = st.checkbox("vr", value=(5 in curr_wd), key=f"edit_wd2_{did}_5")
+                    with cc6: za2 = st.checkbox("za", value=(6 in curr_wd), key=f"edit_wd2_{did}_6")
+                    with cc7: zo2 = st.checkbox("zo", value=(7 in curr_wd), key=f"edit_wd2_{did}_7")
+                    if st.button("Opslaan werkdagen", key=f"save_wd2_{did}"):
+                        new_set = set()
+                        if ma2: new_set.add(1)
+                        if di2: new_set.add(2)
+                        if wo2: new_set.add(3)
+                        if do2: new_set.add(4)
+                        if vr2: new_set.add(5)
+                        if za2: new_set.add(6)
+                        if zo2: new_set.add(7)
+                        wd_df2 = state.dfs["doctor_workdays"].copy()
+                        wd_df2 = wd_df2[wd_df2["doctor_id"].astype(str).str.strip() != did]
+                        for d in sorted(new_set):
+                            wd_df2.loc[len(wd_df2)] = [did, d]
+                        state.dfs["doctor_workdays"] = wd_df2
+                        _autosave()
+                        st.success("Werkdagen opgeslagen.")
 
 st.subheader("Opslaan/Exporteren")
 col_save1, col_save2 = st.columns(2)
@@ -932,206 +1639,14 @@ with col_save2:
         st.download_button("Download Excel nu", data=buf.getvalue(), file_name="megaplanner_data.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
-st.subheader("Optioneel: Genereer sessies op basis van weekregels")
-col1, col2, col3 = st.columns(3)
-with col1:
-    gen_start = st.date_input("Vanaf datum", value=date(date.today().year, date.today().month, 1))
-with col2:
-    gen_end_default = date(date.today().year, 12, 31)
-    gen_end = st.date_input("Tot en met", value=gen_end_default)
-with col3:
-    default_start_time = st.text_input("Sessiestart (HH:MM)", value="09:00")
-    default_end_time = st.text_input("Sessie-einde (HH:MM)", value="17:00")
-
-def _weekday1_7(d: date) -> int:
-    return int(datetime(d.year, d.month, d.day).weekday()) + 1
-
-def _week_of_month1_5(d: date) -> int:
-    return (int(d.day) - 1) // 7 + 1
-
-def _parse_hhmm(txt: str) -> Tuple[int, int]:
-    hh, mm = txt.split(":")
-    return int(hh), int(mm)
-
-def generate_sessions_from_rules(df_locations: pd.DataFrame, df_week_rules: pd.DataFrame, start: date, end: date, start_hhmm: str, end_hhmm: str) -> pd.DataFrame:
-    # Bepaal per datum de set locaties die in weekregels voorkomen
-    loc_ids = set(df_locations["location_id"].astype(str).str.strip().tolist())
-    loc_time_map = {
-        str(r["location_id"]).strip(): (
-            str(r.get("default_start_time", "")).strip(),
-            str(r.get("default_end_time", "")).strip(),
-        )
-        for _, r in df_locations.iterrows()
-    }
-    # Map rooms per locatie (eerste kamer wordt automatisch gekozen indien uniek)
-    room_map: Dict[str, List[str]] = {}
-    if "rooms" in state.dfs:
-        for _, r in state.dfs["rooms"].iterrows():
-            lid = str(r["location_id"]).strip()
-            rn = str(r["name"]).strip()
-            if lid and rn:
-                room_map.setdefault(lid, []).append(rn)
-    out_rows: List[Dict[str, str]] = []
-    existing_ids: Set[str] = set()
-    sh, sm = _parse_hhmm(start_hhmm)
-    eh, em = _parse_hhmm(end_hhmm)
-    curr = start
-    while curr <= end:
-        wom = _week_of_month1_5(curr)
-        wd = _weekday1_7(curr)
-        # alle regels die overeenkomen
-        matching = df_week_rules[
-            (df_week_rules["week_of_month"].astype(str).str.strip() == str(wom)) &
-            (df_week_rules["weekday"].astype(str).str.lower().isin([str(wd), "ma" if wd==1 else "di" if wd==2 else "wo" if wd==3 else "do" if wd==4 else "vr" if wd==5 else "za" if wd==6 else "zo"]))
-        ]
-        day_locations = set(matching["location_id"].astype(str).str.strip().tolist())
-        # filter op bekende locaties
-        day_locations = {loc for loc in day_locations if loc in loc_ids}
-        for loc in sorted(day_locations):
-            session_id = f"GEN-{curr.strftime('%Y%m%d')}-{loc}"
-            if session_id in existing_ids:
-                # als al bestaat, maak suffix
-                k = 2
-                while f"{session_id}-{k}" in existing_ids:
-                    k += 1
-                session_id = f"{session_id}-{k}"
-            existing_ids.add(session_id)
-            # kies per locatie default tijden als aanwezig
-            loc_start, loc_end = loc_time_map.get(loc, ("", ""))
-            use_start = loc_start if loc_start else f"{sh:02d}:{sm:02d}"
-            use_end = loc_end if loc_end else f"{eh:02d}:{em:02d}"
-            # Kies kamer: indien precies 1 kamer voor locatie, gebruik die, anders leeg
-            auto_room = ""
-            rooms_for_loc = room_map.get(loc, [])
-            if len(rooms_for_loc) == 1:
-                auto_room = rooms_for_loc[0]
-            out_rows.append({
-                "session_id": session_id,
-                "date": curr.isoformat(),
-                "location_id": loc,
-                "start_time": use_start,
-                "end_time": use_end,
-                "required_skill": "",
-                "room": auto_room,
-            })
-        curr += timedelta(days=1)
-    return pd.DataFrame(out_rows, columns=["session_id","date","location_id","start_time","end_time","required_skill","room"])
-
-if st.button("Genereer sessies (voegt toe aan Sessions)"):
-    gen_df = generate_sessions_from_rules(state.dfs["locations"], state.dfs["doctor_week_rules"], gen_start, gen_end, default_start_time, default_end_time)
-    if len(gen_df) == 0:
-        st.warning("Geen sessies gegenereerd; controleer weekregels en periode.")
-    else:
-        # concat en deduplicate op session_id
-        merged = pd.concat([state.dfs["sessions"], gen_df], ignore_index=True)
-        merged = merged.drop_duplicates(subset=["session_id"], keep="last")
-        state.dfs["sessions"] = merged
-        st.success(f"{len(gen_df)} sessies toegevoegd.")
 
 
-st.subheader("Plannen")
-if st.button("Maak planning"):
-    # Schrijf naar tijdelijke buffers en gebruik bestaande readers (valideren formats)
-    def df_to_csv_bytes(df: pd.DataFrame) -> io.BytesIO:
-        buf = io.BytesIO()
-        df.to_csv(buf, index=False)
-        buf.seek(0)
-        return buf
 
-    doctors = read_doctors(df_to_csv_bytes(state.dfs["doctors"]))
-    locations = read_locations(df_to_csv_bytes(state.dfs["locations"]))
-    sessions = read_sessions(df_to_csv_bytes(state.dfs["sessions"]))
-    preferences = read_preferences(df_to_csv_bytes(state.dfs["preferences"]))
-    travel_times = read_travel_times(df_to_csv_bytes(state.dfs["travel_times"])) if len(state.dfs["travel_times"]) > 0 else {}
-    workdays = read_doctor_workdays(df_to_csv_bytes(state.dfs["doctor_workdays"])) if len(state.dfs["doctor_workdays"]) > 0 else {}
-    week_rules = read_doctor_week_rules(df_to_csv_bytes(state.dfs["doctor_week_rules"])) if len(state.dfs["doctor_week_rules"]) > 0 else []
-
-    try:
-        assignments, objective = solve_schedule(doctors, locations, sessions, preferences, travel_times, workdays, week_rules)
-    except Exception as e:
-        st.error(f"Planner fout: {e}")
-    else:
-        st.success(f"Planning gereed. Totale voorkeursscore: {objective}")
-        # Toon resultaat
-        rows = []
-        for sess_id, doc_id in assignments.items():
-            s = sessions[sess_id]
-            d = doctors[doc_id]
-            rows.append({
-                "date": s.date.isoformat(),
-                "session_id": s.session_id,
-                "location_id": s.location_id,
-                "doctor_id": d.doctor_id,
-                "doctor_name": d.name,
-                "start_time": s.start_time.strftime("%H:%M"),
-                "end_time": s.end_time.strftime("%H:%M"),
-                "room": getattr(s, "room", ""),
-                "required_skill": s.required_skill or "",
-            })
-        result_df = pd.DataFrame(rows).sort_values(["date", "location_id", "start_time"])
-        st.dataframe(result_df, use_container_width=True)
-        # Bewaar in state voor Agenda
-        state.schedule_df = result_df.copy()
-        # Schrijf ook naar schijf voor latere sessies
-        try:
-            write_schedule_csv(Path("output/schedule.csv"), assignments, doctors, locations, sessions)
-        except Exception:
-            pass
-
-        # Downloads
-        csv_buf = io.StringIO()
-        result_df.to_csv(csv_buf, index=False)
-        st.download_button("Download CSV", data=csv_buf.getvalue(), file_name="schedule.csv", mime="text/csv")
-
-        xlsx_buf = io.BytesIO()
-        with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
-            result_df.to_excel(writer, index=False, sheet_name="Schedule")
-            # optioneel: ook data meegeven
-            state.dfs["doctors"].to_excel(writer, index=False, sheet_name="Doctors")
-            state.dfs["locations"].to_excel(writer, index=False, sheet_name="Locations")
-            state.dfs["sessions"].to_excel(writer, index=False, sheet_name="Sessions")
-            state.dfs["preferences"].to_excel(writer, index=False, sheet_name="Preferences")
-            state.dfs["travel_times"].to_excel(writer, index=False, sheet_name="TravelTimes")
-            state.dfs["doctor_workdays"].to_excel(writer, index=False, sheet_name="DoctorWorkdays")
-            state.dfs["doctor_week_rules"].to_excel(writer, index=False, sheet_name="DoctorWeekRules")
-        st.download_button("Download Excel", data=xlsx_buf.getvalue(), file_name="schedule.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 st.divider()
 st.caption("Tip: gebruik weekregels en vaste werkdagen om snel sessies voor de rest van het jaar te genereren en met één klik te plannen.")
 
-st.subheader("Snel plannen")
-colA, colB, colC = st.columns(3)
-with colA:
-    plan_end = st.date_input("Plan t/m datum", value=date(date.today().year, 12, 31), key="plan_end_input")
-with colB:
-    if st.button("Plan t/m datum (genereer + plan)"):
-        gen_df = generate_sessions_from_rules(state.dfs["locations"], state.dfs["doctor_week_rules"], date.today(), plan_end, default_start_time, default_end_time)
-        merged = pd.concat([state.dfs["sessions"], gen_df], ignore_index=True).drop_duplicates(subset=["session_id"], keep="last")
-        state.dfs["sessions"] = merged
-        # run planning
-        try:
-            def df_to_csv_bytes(df: pd.DataFrame) -> io.BytesIO:
-                buf = io.BytesIO()
-                df.to_csv(buf, index=False)
-                buf.seek(0)
-                return buf
-            doctors = read_doctors(df_to_csv_bytes(state.dfs["doctors"]))
-            locations = read_locations(df_to_csv_bytes(state.dfs["locations"]))
-            sessions = read_sessions(df_to_csv_bytes(state.dfs["sessions"]))
-            preferences = read_preferences(df_to_csv_bytes(state.dfs["preferences"]))
-            travel_times = read_travel_times(df_to_csv_bytes(state.dfs["travel_times"])) if len(state.dfs["travel_times"]) > 0 else {}
-            workdays = read_doctor_workdays(df_to_csv_bytes(state.dfs["doctor_workdays"])) if len(state.dfs["doctor_workdays"]) > 0 else {}
-            week_rules = read_doctor_week_rules(df_to_csv_bytes(state.dfs["doctor_week_rules"])) if len(state.dfs["doctor_week_rules"]) > 0 else []
-            assignments, objective = solve_schedule(doctors, locations, sessions, preferences, travel_times, workdays, week_rules)
-        except Exception as e:
-            st.error(f"Planner fout: {e}")
-        else:
-            st.success(f"Planning gereed t/m {plan_end.isoformat()}. Totale voorkeursscore: {objective}")
-    with colC:
-        if st.button("Plan t/m einde jaar (genereer + plan)"):
-            end_of_year = date(date.today().year, 12, 31)
-            st.session_state["plan_end_input"] = end_of_year
-            st.experimental_rerun()
+
 
 st.subheader("Controleer data")
 if st.button("Controleer data (validatie)"):
@@ -1296,4 +1811,7 @@ if mode == "Agenda (planning)":
                     st.dataframe(df_doc[["date","start_time","end_time","location_id","room","session_id"]].reset_index(drop=True), use_container_width=True)
             # Export van gefilterde view
             st.download_button("Download gefilterde agenda (CSV)", data=view.to_csv(index=False), file_name="agenda_filtered.csv", mime="text/csv")
+else:
+    with sidebar_panel.container():
+        st.info("Sessiedetails worden hier getoond wanneer je in de Agenda-modus een sessie selecteert.")
 

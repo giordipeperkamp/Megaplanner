@@ -62,6 +62,10 @@ Als `localhost` niet opent:
 - Gebruik direct `http://127.0.0.1:8502`
 - Controleer of geen andere app poort 8502 gebruikt (bestand `run_gui.bat` kun je aanpassen naar een andere poort)
 
+### Outlook-achtige kalendercomponent
+- De drag & drop pop-up draait in `src/webui/mega_calendar`.
+- Wil je het gedrag/uiterlijk aanpassen? Voer dan eenmaal `npm install` uit in `src/webui/mega_calendar/frontend` en daarna `npm run build` wanneer je de React-code wijzigt. De Streamlit-app gebruikt de gebuilde bestanden in `frontend/build`.
+
 ### CSV-formaten
 - `doctors.csv`
   - kolommen: `doctor_id,name,max_sessions,unavailable_dates,skills`

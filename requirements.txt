@@ -3,4 +3,5 @@ pandas==2.2.3
 python-dateutil==2.9.0.post0
 openpyxl==3.1.5
 streamlit==1.40.1
+streamlit-calendar==1.2.0
 
